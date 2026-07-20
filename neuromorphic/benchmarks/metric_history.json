@@ -1,0 +1,20 @@
+{
+  "description": "Rolling per-metric history for cross-run anomaly detection (issue #299). Each list is capped at window_size most-recent points. Seeded from 5 real BenchmarkSuite runs on scripts/benchmark_anomaly_detector.py's small CI network profile, varying only network_seed (weight-init) to capture genuine spread across different valid initializations -- same approach as benchmarks/learning_evidence_baseline.json (issue #286). concept_separability sits at a reproducible 0.0 floor at this CI scale (100-neuron concept layer, 4 patterns, few reps has too little capacity/training to separate classes) -- not a bug; any future non-zero value is a real deviation worth a human look, not noise. Refresh via `python scripts/benchmark_anomaly_detector.py --update-history`, review the output, then commit it here -- do not hand-edit.",
+  "window_size": 30,
+  "history": {
+    "concept_separability": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "binding_accuracy": [
+      0.25,
+      0.0,
+      0.5,
+      0.25,
+      0.25
+    ]
+  }
+}

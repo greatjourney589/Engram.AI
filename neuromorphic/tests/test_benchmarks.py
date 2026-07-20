@@ -10,21 +10,28 @@ import numpy as np
 import pytest
 
 from neuromorphic.benchmarks import (
+    DEFAULT_TRACKED_METRICS,
     INTENTIONALLY_SPARSE_REGIONS,
     AssociationStrengthBenchmark,
     BenchmarkSuite,
     ConceptSeparabilityBenchmark,
     CrossModalRecallBenchmark,
     EnergyEfficiencyBenchmark,
+    MetricAnomaly,
     NoveltyDetectionBenchmark,
     RegionQuietFlag,
     _confidence_interval,
     _flatten_numeric,
     _to_native,
+    append_metric_history,
     audit_pattern_diversity,
     classify_quiet_regions,
+    detect_metric_anomalies,
+    extract_tracked_metrics,
+    format_anomaly_report,
     format_quiet_region_report,
     generate_test_patterns,
+    load_metric_history,
 )
 from neuromorphic.config import NeuromorphicConfig
 from neuromorphic.network import NeuromorphicNetwork
@@ -646,3 +653,149 @@ class TestRuntimeBudget:
         assert len(failures) == 1
         assert "31.00s" in failures[0]
         assert "30.00s" in failures[0]
+
+
+class TestExtractTrackedMetrics:
+    def test_pulls_silhouette_and_f1(self):
+        results = {
+            "concept_separability": {"silhouette_score": 0.42, "linear_probe_accuracy": 0.9},
+            "cross_modal_binding_accuracy": {"f1": 0.75, "precision": 0.8},
+        }
+        metrics = extract_tracked_metrics(results)
+        assert metrics == {"concept_separability": 0.42, "binding_accuracy": 0.75}
+
+    def test_excludes_degenerate_concept_separability_error_shape(self):
+        results = {
+            "concept_separability": {
+                "error": "insufficient patterns for separability",
+                "silhouette_score": 0.0,
+                "linear_probe_accuracy": 0.0,
+            },
+            "cross_modal_binding_accuracy": {"f1": 0.5},
+        }
+        metrics = extract_tracked_metrics(results)
+        assert "concept_separability" not in metrics
+        assert metrics["binding_accuracy"] == 0.5
+
+    def test_missing_keys_produce_empty_dict(self):
+        assert extract_tracked_metrics({}) == {}
+
+    def test_metric_names_can_be_restricted(self):
+        results = {
+            "concept_separability": {"silhouette_score": 0.1},
+            "cross_modal_binding_accuracy": {"f1": 0.2},
+        }
+        metrics = extract_tracked_metrics(results, metric_names=("concept_separability",))
+        assert metrics == {"concept_separability": 0.1}
+
+    def test_default_tracked_metrics_matches_dashboard_visible_pair(self):
+        assert set(DEFAULT_TRACKED_METRICS) == {"concept_separability", "binding_accuracy"}
+
+
+class TestMetricHistoryPersistence:
+    def test_load_missing_file_returns_empty(self, tmp_path):
+        assert load_metric_history(tmp_path / "nope.json") == {}
+
+    def test_append_then_load_round_trips(self, tmp_path):
+        path = tmp_path / "history.json"
+        append_metric_history(path, {"concept_separability": 0.1})
+        append_metric_history(path, {"concept_separability": 0.2})
+        history = load_metric_history(path)
+        assert history["concept_separability"] == [0.1, 0.2]
+
+    def test_window_caps_history_length(self, tmp_path):
+        path = tmp_path / "history.json"
+        for i in range(5):
+            append_metric_history(path, {"m": float(i)}, window_size=3)
+        history = load_metric_history(path)
+        assert history["m"] == [2.0, 3.0, 4.0]
+
+    def test_independent_metrics_tracked_separately(self, tmp_path):
+        path = tmp_path / "history.json"
+        append_metric_history(path, {"a": 1.0, "b": 100.0})
+        append_metric_history(path, {"a": 2.0})
+        history = load_metric_history(path)
+        assert history["a"] == [1.0, 2.0]
+        assert history["b"] == [100.0]
+
+    def test_persisted_file_round_trips_through_disk(self, tmp_path):
+        path = tmp_path / "history.json"
+        append_metric_history(path, {"m": 1.0})
+        # Fresh load from disk, not the in-memory return value.
+        assert load_metric_history(path) == {"m": [1.0]}
+
+
+class TestDetectMetricAnomalies:
+    def test_value_within_threshold_not_flagged(self):
+        history = {"m": [0.9, 1.0, 1.1, 1.0, 0.95]}
+        anomalies = detect_metric_anomalies({"m": 1.0}, history)
+        assert len(anomalies) == 1
+        assert anomalies[0].flagged is False
+
+    def test_value_beyond_threshold_flagged(self):
+        history = {"m": [1.0, 1.0, 1.0, 1.0, 1.0, 1.05, 0.95, 1.02]}
+        # Small noise around 1.0 -> std is tiny; 10.0 is wildly out of range.
+        anomalies = detect_metric_anomalies({"m": 10.0}, history)
+        assert len(anomalies) == 1
+        assert anomalies[0].flagged is True
+        assert anomalies[0].z_score > 2.0
+
+    def test_insufficient_history_not_flagged(self):
+        history = {"m": [1.0, 1.0]}  # below default min_history=3
+        anomalies = detect_metric_anomalies({"m": 100.0}, history)
+        assert anomalies[0].flagged is False
+        assert anomalies[0].n_history == 2
+
+    def test_no_history_at_all_not_flagged(self):
+        anomalies = detect_metric_anomalies({"m": 1.0}, {})
+        assert anomalies[0].flagged is False
+        assert anomalies[0].n_history == 0
+
+    def test_zero_variance_history_flags_any_deviation(self):
+        history = {"m": [1.0, 1.0, 1.0, 1.0]}
+        flagged = detect_metric_anomalies({"m": 1.5}, history)
+        assert flagged[0].flagged is True
+        assert flagged[0].z_score == float("inf")
+
+    def test_zero_variance_history_matching_value_not_flagged(self):
+        history = {"m": [1.0, 1.0, 1.0, 1.0]}
+        matching = detect_metric_anomalies({"m": 1.0}, history)
+        assert matching[0].flagged is False
+
+    def test_threshold_is_configurable(self):
+        history = {"m": [1.0, 1.02, 0.98, 1.01, 0.99]}
+        # Right at ~1 std dev from the mean given this tight cluster.
+        loose = detect_metric_anomalies({"m": 1.03}, history, threshold=5.0)
+        strict = detect_metric_anomalies({"m": 1.03}, history, threshold=0.01)
+        assert loose[0].flagged is False
+        assert strict[0].flagged is True
+
+    def test_multiple_metrics_evaluated_independently(self):
+        history = {
+            "a": [1.0, 1.0, 1.0, 1.0],
+            "b": [1.0, 1.0, 1.0, 1.0],
+        }
+        anomalies = detect_metric_anomalies({"a": 1.0, "b": 5.0}, history)
+        by_metric = {a.metric: a for a in anomalies}
+        assert by_metric["a"].flagged is False
+        assert by_metric["b"].flagged is True
+
+    def test_returns_metric_anomaly_instances(self):
+        anomalies = detect_metric_anomalies({"m": 1.0}, {"m": [1.0, 1.0, 1.0]})
+        assert isinstance(anomalies[0], MetricAnomaly)
+
+
+class TestFormatAnomalyReport:
+    def test_empty_list(self):
+        assert "no tracked metrics" in format_anomaly_report([])
+
+    def test_flags_render_with_bang_icon(self):
+        anomalies = detect_metric_anomalies({"m": 10.0}, {"m": [1.0, 1.0, 1.0, 1.0]})
+        report = format_anomaly_report(anomalies)
+        assert "[!]" in report
+        assert "m" in report
+
+    def test_healthy_metric_renders_without_bang(self):
+        anomalies = detect_metric_anomalies({"m": 1.0}, {"m": [1.0, 1.0, 1.0, 1.0]})
+        report = format_anomaly_report(anomalies)
+        assert "[!]" not in report

@@ -569,6 +569,208 @@ def format_quiet_region_report(flags: list[RegionQuietFlag]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cross-run anomaly detection (issue #299)
+#
+# No historical-mean tracking of any BenchmarkSuite metric existed before
+# this: each run's summary() was evaluated in isolation, so a regression that
+# no one happened to eyeball was functionally invisible. Per the issue's own
+# staged scope, this starts with just concept_separability and
+# binding_accuracy (the two already dashboard-visible metrics, see
+# dashboard/src/dashboard/learning_evidence.py::extract_learning_metrics) —
+# DEFAULT_TRACKED_METRICS documents the extension point for item #22's full
+# 6-metric rollout.
+# ---------------------------------------------------------------------------
+
+#: Default rolling-window cap per metric in the history log — bounds file
+#: growth; old points age out as new ones are appended.
+DEFAULT_HISTORY_WINDOW = 30
+
+#: |z-score| beyond which a metric is flagged as anomalous (the issue's ">2
+#: std devs" criterion).
+DEFAULT_ANOMALY_THRESHOLD = 2.0
+
+#: Minimum prior data points required before a metric's history is trusted
+#: enough to flag against — a mean/std computed from 1-2 points is noise, not
+#: a distribution.
+DEFAULT_MIN_HISTORY = 3
+
+#: The two metrics tracked by default (issue #299's staged minimal scope).
+#: Extend this once item #22 lands full 6-metric dashboard visibility.
+DEFAULT_TRACKED_METRICS: tuple[str, ...] = ("concept_separability", "binding_accuracy")
+
+
+def extract_tracked_metrics(
+    results: dict[str, Any],
+    metric_names: tuple[str, ...] = DEFAULT_TRACKED_METRICS,
+) -> dict[str, float]:
+    """Pull the tracked scalar metrics out of a BenchmarkSuite.run_all() result.
+
+    Mirrors dashboard/learning_evidence.py::extract_learning_metrics()'s field
+    choices for these two metrics specifically (silhouette_score as the
+    concept_separability proxy, f1 as the binding_accuracy proxy) so "anomaly
+    detection" and "what the dashboard shows" never silently diverge. Not
+    imported directly from there: this reads the raw run_all() dict already
+    in hand, so it doesn't need that module's file-format-guessing fallback
+    chain (built for reading arbitrary saved JSON of unknown origin).
+
+    A degenerate concept_separability run (n_classes < 2, insufficient
+    patterns — see ConceptSeparabilityBenchmark.run()'s "error" shape) has a
+    placeholder 0.0 silhouette_score, not a real measurement; it is excluded
+    here rather than silently treated as a real low score (see issue #308).
+    """
+    metrics: dict[str, float] = {}
+    if "concept_separability" in metric_names:
+        cs = results.get("concept_separability") or {}
+        if "error" not in cs and "silhouette_score" in cs:
+            metrics["concept_separability"] = float(cs["silhouette_score"])
+    if "binding_accuracy" in metric_names:
+        ba = results.get("cross_modal_binding_accuracy") or {}
+        if "f1" in ba:
+            metrics["binding_accuracy"] = float(ba["f1"])
+    return metrics
+
+
+def load_metric_history(path: Path) -> dict[str, list[float]]:
+    """Load the rolling per-metric history log, or an empty one if absent."""
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return dict(data.get("history", {}))
+
+
+def append_metric_history(
+    path: Path,
+    current_metrics: dict[str, float],
+    *,
+    window_size: int = DEFAULT_HISTORY_WINDOW,
+) -> dict[str, list[float]]:
+    """Append this run's tracked metrics to the rolling JSON log and persist it.
+
+    Each metric's list is capped to the last `window_size` points — a rolling
+    window, not an unbounded log, so the file doesn't grow forever.
+    """
+    history = load_metric_history(path)
+    for name, value in current_metrics.items():
+        history.setdefault(name, []).append(value)
+        history[name] = history[name][-window_size:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "description": (
+                    "Rolling per-metric history for cross-run anomaly detection "
+                    "(issue #299). Each list is capped at window_size most-recent "
+                    "points; refresh/extend via BenchmarkSuite's anomaly-detection "
+                    "helpers, not by hand-editing."
+                ),
+                "window_size": window_size,
+                "history": history,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return history
+
+
+@dataclass(frozen=True)
+class MetricAnomaly:
+    """One metric's anomaly classification from detect_metric_anomalies()."""
+
+    metric: str
+    value: float
+    historical_mean: float
+    historical_std: float
+    z_score: float
+    n_history: int
+    flagged: bool
+    note: str
+
+
+def detect_metric_anomalies(
+    current_metrics: dict[str, float],
+    history: dict[str, list[float]],
+    *,
+    threshold: float = DEFAULT_ANOMALY_THRESHOLD,
+    min_history: int = DEFAULT_MIN_HISTORY,
+) -> list[MetricAnomaly]:
+    """Flag any current metric that falls more than `threshold` std devs from
+    its historical mean (issue #299's ">2 std devs" criterion).
+
+    `history` must NOT include the current run (compare before appending —
+    see append_metric_history(), called separately once anomalies are
+    computed, so a run is never compared against itself).
+
+    Metrics with fewer than `min_history` prior points are skipped (not
+    flagged) rather than compared against a near-meaningless 1-2-point
+    "distribution" — reported with n_history so callers can see why.
+    """
+    anomalies = []
+    for metric, value in current_metrics.items():
+        past = history.get(metric, [])
+        if len(past) < min_history:
+            anomalies.append(
+                MetricAnomaly(
+                    metric=metric,
+                    value=value,
+                    historical_mean=float(np.mean(past)) if past else 0.0,
+                    historical_std=0.0,
+                    z_score=0.0,
+                    n_history=len(past),
+                    flagged=False,
+                    note=f"only {len(past)} prior run(s), need >= {min_history} to compare",
+                )
+            )
+            continue
+
+        arr = np.asarray(past, dtype=np.float64)
+        mean = float(arr.mean())
+        std = float(arr.std(ddof=1))
+
+        if std == 0.0:
+            # A perfectly stable metric: any deviation at all is anomalous by
+            # definition (there is no natural variance to attribute it to),
+            # not just deviations past an arbitrary z-score threshold.
+            flagged = abs(value - mean) > 1e-9
+            z_score = float("inf") if flagged else 0.0
+            note = (
+                f"historical values are all {mean:.6g} (zero variance) — "
+                f"{'differs' if flagged else 'matches'} exactly"
+            )
+        else:
+            z_score = (value - mean) / std
+            flagged = abs(z_score) > threshold
+            note = f"{abs(z_score):.2f} std devs from the mean of the last {len(past)} runs" + (
+                f" (exceeds {threshold:.1f}σ threshold)" if flagged else ""
+            )
+
+        anomalies.append(
+            MetricAnomaly(
+                metric=metric,
+                value=value,
+                historical_mean=mean,
+                historical_std=std,
+                z_score=z_score,
+                n_history=len(past),
+                flagged=flagged,
+                note=note,
+            )
+        )
+    return anomalies
+
+
+def format_anomaly_report(anomalies: list[MetricAnomaly]) -> str:
+    """Human-readable rendering of detect_metric_anomalies() output for CI logs."""
+    if not anomalies:
+        return "  (no tracked metrics to compare)"
+    lines = []
+    for a in anomalies:
+        icon = "!" if a.flagged else " "
+        lines.append(f"  [{icon}] {a.metric:22s} value={a.value:.4f}  {a.note}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Benchmark 5: Concept Separability
 # ---------------------------------------------------------------------------
 class ConceptSeparabilityBenchmark:
